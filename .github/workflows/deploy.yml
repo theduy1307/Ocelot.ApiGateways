@@ -1,0 +1,72 @@
+name: Deploy Staging
+
+on:
+  workflow_run:
+    workflows:
+      - "CI"
+    types:
+      - completed
+
+jobs:
+  deploy:
+    name: Deploy to Staging Slot
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish app
+        run: dotnet publish -c Release -o published
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-oidc: true
+
+      - name: Deploy to App Service slot 'staging'
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          slot-name: staging
+          package: published
+
+      - name: Smoke test /health
+        env:
+          APP_URL: https://${{ secrets.AZURE_WEBAPP_NAME }}-staging.azurewebsites.net/health
+        run: |
+          set -e
+          echo "Testing $APP_URL"
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "$APP_URL" || echo "000")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health OK"
+              exit 0
+            else
+              echo "Attempt $i: status $STATUS"
+              sleep 5
+            fi
+          done
+          echo "Health check failed" >&2
+          exit 1
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          DEPLOY_STATUS: ${{ job.status }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "SLACK_WEBHOOK not set, skipping notification"
+            exit 0
+          fi
+          PAYLOAD=$(printf '{"text":"Deployment to staging for %s finished with status: %s"}' "$GITHUB_REPOSITORY" "$DEPLOY_STATUS")
+          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true

@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: nuget-packages-${{ runner.os }}-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            nuget-packages-${{ runner.os }}-
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build (Release)
+        run: dotnet build -c Release --no-restore
+
+  test:
+    name: Test & Coverage
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Run tests with coverage
+        run: |
+          set -e
+          dotnet test -c Release --no-build /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput=./TestResults/coverage.opencover.xml
+
+      - name: Install ReportGenerator
+        run: dotnet tool install -g dotnet-reportgenerator-globaltool --version 5.1.23 || true
+
+      - name: Create coverage report (TextSummary)
+        env:
+          PATH: ${{ env.PATH }}:$HOME/.dotnet/tools
+        run: |
+          set -e
+          mkdir -p coverage-report
+          reportgenerator -reports:"**/coverage.opencover.xml" -reporttypes:TextSummary -targetdir:coverage-report | true
+          # Try to extract line coverage percent from generated Summary
+          if [ -f coverage-report/Summary.txt ]; then
+            PCT=$(grep -Po "Line.*?([0-9]+(\.[0-9]+)?)%" coverage-report/Summary.txt | grep -Po "([0-9]+(\.[0-9]+)?)") || true
+          else
+            PCT=$(reportgenerator -reports:"**/coverage.opencover.xml" -reporttypes:TextSummary -targetdir:coverage-report | grep -Po "Line.*?([0-9]+(\.[0-9]+)?)%" | grep -Po "([0-9]+(\.[0-9]+)?)") || true
+          fi
+          echo "Coverage percent: ${PCT}"
+          THRESHOLD=70
+          if [ -z "$PCT" ]; then
+            echo "Could not determine coverage percentage" >&2
+            exit 1
+          fi
+          CMP=$(awk -v a=$PCT -v b=$THRESHOLD 'BEGIN{print (a>=b)?0:1}')
+          if [ "$CMP" -ne 0 ]; then
+            echo "Coverage $PCT% is below threshold of ${THRESHOLD}%" >&2
+            exit 1
+          fi
+
+  security:
+    name: Security Scan
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Check vulnerable packages
+        run: |
+          set -e
+          dotnet list Ocelot.ApiGateways.csproj package --vulnerable | tee vulnerable.txt || true
+          if grep -i "critical" vulnerable.txt; then
+            echo "Critical vulnerabilities found" >&2
+            exit 1
+          else
+            echo "No critical vulnerabilities found"
+          fi
+
+  package:
+    name: Package
+    needs: [test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish
+        run: dotnet publish -c Release -o published --no-build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: published
+          path: published
